@@ -86,6 +86,8 @@ def main(argv=None):
     ap.add_argument("--bank", default=str(DEFAULT_BANK))
     ap.add_argument("--seed", type=int, default=60)
     ap.add_argument("-o", "--out", help="write full JSON manifest(s) here")
+    ap.add_argument("--write-shard", action="store_true",
+                    help="with --veda-samples, refresh examples/vedic_four_vedas_shard.json")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -148,8 +150,8 @@ def main(argv=None):
         if not args.quiet:
             print(f"wrote {args.out}")
 
-    # Also refresh the checked-in four-veda shard when running samples
-    if args.veda_samples:
+    # Optional refresh of the checked-in four-veda shard (off by default — no surprise diffs)
+    if args.veda_samples and args.write_shard:
         shard_path = ROOT / "examples" / "vedic_four_vedas_shard.json"
         shard_path.write_text(
             json.dumps(

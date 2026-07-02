@@ -48,11 +48,11 @@ def test_accent_array_aligns_with_gana_syllables():
     assert list(zip(aks, acc)) == [
         ("a", "anudatta"),
         ("gni", None),
-        ("mI", "udatta"),
+        ("mI", "svarita"),
         ("le", None),
         ("pu", "anudatta"),
         ("ro", None),
-        ("hi", "udatta"),
+        ("hi", "svarita"),
         ("tam", None),
     ]
     assert kn.startswith("ಅ")
@@ -63,12 +63,39 @@ def test_om_two_nucleus_alignment():
     kn, acc = model_text(src)
     aks = syllabify_slp1(align_slp1(src))
     assert list(zip(aks, acc)) == [
-        ("A", "udatta"),
+        ("A", "svarita"),
         ("UM", None),
         ("na", None),
         ("maH", "anudatta"),
     ]
     assert _oov_accents(kn) == []
+
+
+def test_sandhi_utva_keeps_accent_on_merged_nucleus():
+    """रा॑मः अ॒स्ति → rAmo 'sti: anudatta on a must land on mo, not sti."""
+    from prep_text import remap_accents_slp1, visarga_sandhi
+    from indic_transliteration import sanscript
+
+    src = "रा\u0951मः अ\u0952स्ति"
+    _kn, acc = model_text_sandhi(src, echo_final=False)
+    clean, raw = __import__("prep_text", fromlist=["prep_deva"]).prep_deva(src)
+    pre = sanscript.transliterate(clean, sanscript.DEVANAGARI, sanscript.SLP1)
+    post = visarga_sandhi(pre)
+    aks = syllabify_slp1(post)
+    assert list(zip(aks, acc)) == [
+        ("rA", "svarita"),
+        ("mo", "anudatta"),
+        ("sti", None),
+    ]
+    # direct remap unit check
+    mapped = remap_accents_slp1(pre, post, raw)
+    assert mapped == ["svarita", "anudatta", None]
+
+
+def test_sandhi_echo_pads_new_nucleus_with_none():
+    src = "गुरु\u0952ः"
+    _kn, acc = model_text_sandhi(src, echo_final=True)
+    assert acc == [None, "anudatta", None]
 
 
 def test_yajurvedic_midline_svarita():

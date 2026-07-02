@@ -7,12 +7,14 @@ Two outputs per verse:
                  sibilant-gemination, shloka-final visarga preserved) + anusvāra→homorganic nasal.
 All processing is done in Devanagari (Kannada sources transliterated in first).
 
-Vedic pārāyaṇa (future-proofing): Devanagari pitch-accent marks (udātta U+0951, anudātta U+0952,
-svarita / Vedic Extensions U+1CD0–U+1CFF) are stripped *before* Deva→SLP1→Kannada so IndicF5's
-Kannada route never sees OOV combining marks. Accents are reattached as a parallel syllable-aligned
-metadata array for a future pitch / pārāyaṇa conditioner.
+Vedic pārāyaṇa (future-proofing): Devanagari pitch-accent marks (anudātta U+0952, svarita glyph
+U+0951 in RV print tradition, Vedic Extensions U+1CD0–U+1CFF) are stripped *before*
+Deva→SLP1→Kannada so IndicF5's Kannada route never sees OOV combining marks. Accents are reattached
+as a parallel syllable-aligned metadata array for a future pitch / pārāyaṇa conditioner. Unmarked
+syllables are implicit udātta in RV notation (stored as None).
 """
 import re
+from difflib import SequenceMatcher
 from indic_transliteration import sanscript
 
 VIRAMA = "्"        # ्
@@ -24,11 +26,12 @@ NUKTA = "़"         # ़
 CANDRABINDU = "ँ"   # ँ
 
 # ── Vedic pitch accents (structural; not phonemes) ───────────────────────────────────
-# Unicode names UDATTA/ANUDATTA for U+0951/U+0952; Rigvedic print tradition often paints
-# U+0951 on *svarita* syllables and leaves udātta unmarked — we store the glyph's formal
-# label so downstream can reinterpret per recension.
+# Labels follow Rigvedic / pārāyaṇa print convention, not raw Unicode character names:
+#   U+0951 DEVANAGARI STRESS SIGN UDATTA is painted on *svarita* syllables in RV saṃhitā;
+#   true udātta is typically unmarked (None in accent_array).
+#   U+0952 = anudātta. Vedic Extensions carry explicit svarita / anudātta variants.
 _SVARA_LABEL = {
-    "\u0951": "udatta",          # DEVANAGARI STRESS SIGN UDATTA (॑)
+    "\u0951": "svarita",         # RV saṃhitā svarita stroke (Unicode name: UDATTA)
     "\u0952": "anudatta",        # DEVANAGARI STRESS SIGN ANUDATTA (॒)
     "\u0953": "grave",           # DEVANAGARI GRAVE ACCENT
     "\u0954": "acute",           # DEVANAGARI ACUTE ACCENT
@@ -150,7 +153,7 @@ def extract_svara(deva):
 
     Returns (clean_deva, accent_array) where accent_array[i] is the pitch label for the i-th
     vowel-bearing syllable — the same indexing as chandas_labeler.syllabify_slp1 / scan after
-    Deva→SLP1. Labels: None | 'udatta' | 'anudatta' | 'svarita' | 'double_svarita' | …
+    Deva→SLP1. Labels: None (implicit udātta in RV) | 'anudatta' | 'svarita' | …
     Accents attach to the most recent open syllable (standard RV/YV encoding).
     """
     out = []
@@ -225,26 +228,122 @@ def slp1_syllable_count(slp):
     """Number of vowel nuclei in SLP1 — equals len(chandas_labeler.scan(...)[0])."""
     return sum(1 for c in slp if c in _SLP1_VOWELS)
 
+def slp1_vowel_positions(slp):
+    """Character offsets of each SLP1 vowel nucleus (gaṇa syllable index order)."""
+    return [i for i, c in enumerate(slp) if c in _SLP1_VOWELS]
+
 def align_accent_array(accents, n_syll):
-    """Pad/truncate accent metadata so it is exactly 1:1 with gaṇa syllables."""
+    """Pad/truncate accent metadata so it is exactly 1:1 with gaṇa syllables.
+    Prefer remap_accents_slp1 when the SLP1 string itself changed (sandhi/echo/F→rU)."""
     if len(accents) == n_syll:
         return list(accents)
     if len(accents) < n_syll:
         return list(accents) + [None] * (n_syll - len(accents))
     return list(accents[:n_syll])
 
+def _merge_accent(a, b):
+    """Combine two labels on one surviving nucleus; later non-None wins."""
+    return b if b is not None else a
+
+def _scatter_accents(src_accents, pre_idxs, out, post_idxs):
+    """Map accents from pre syllable indices onto post indices (merge/split aware)."""
+    if not post_idxs:
+        return
+    if not pre_idxs:
+        return
+    n_pre, n_post = len(pre_idxs), len(post_idxs)
+    if n_pre == n_post:
+        for pi, pj in zip(pre_idxs, post_idxs):
+            out[pj] = _merge_accent(out[pj], src_accents[pi])
+        return
+    for k, pj in enumerate(post_idxs):
+        start = k * n_pre // n_post
+        end = max(start + 1, (k + 1) * n_pre // n_post) if n_pre >= n_post else start + 1
+        end = min(end, n_pre)
+        if n_pre < n_post:
+            start = min(k, n_pre - 1)
+            end = start + 1
+        for pi in pre_idxs[start:end]:
+            out[pj] = _merge_accent(out[pj], src_accents[pi])
+
+def remap_accents_slp1(pre_slp, post_slp, accents):
+    """Reattach accent_array after an SLP1 transform (sandhi, echo, F→rU, …).
+
+    Uses SequenceMatcher on the full SLP1 strings and maps vowel nuclei inside each opcode
+    block so mid-string merges/deletes (utva/lopa) keep labels on the surviving syllable
+    instead of shifting via end-padding.
+    """
+    pre_v = slp1_vowel_positions(pre_slp)
+    post_v = slp1_vowel_positions(post_slp)
+    src = align_accent_array(accents, len(pre_v))
+    if pre_slp == post_slp:
+        return src
+    if not post_v:
+        return []
+    if not pre_v:
+        return [None] * len(post_v)
+
+    out = [None] * len(post_v)
+    pre_at = {pos: k for k, pos in enumerate(pre_v)}
+    post_at = {pos: k for k, pos in enumerate(post_v)}
+    sm = SequenceMatcher(a=pre_slp, b=post_slp, autojunk=False)
+
+    orphan = []  # (pre_syll_index, accent) deleted with no in-block post target
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        pre_idxs = [pre_at[p] for p in pre_v if i1 <= p < i2]
+        post_idxs = [post_at[p] for p in post_v if j1 <= p < j2]
+        if tag == "equal":
+            for pi, pj in zip(pre_idxs, post_idxs):
+                out[pj] = _merge_accent(out[pj], src[pi])
+        elif tag == "replace":
+            if not post_idxs:
+                # e.g. utva elides following 'a' into avagraha — keep label as orphan
+                for pi in pre_idxs:
+                    if src[pi] is not None:
+                        orphan.append((pi, src[pi]))
+            elif not pre_idxs:
+                pass  # inserted nuclei stay None
+            else:
+                _scatter_accents(src, pre_idxs, out, post_idxs)
+        elif tag == "delete":
+            for pi in pre_idxs:
+                if src[pi] is not None:
+                    orphan.append((pi, src[pi]))
+        # insert: new nuclei stay None
+
+    for pi, lab in orphan:
+        # Map deleted pre nucleus to closest surviving post nucleus (prefer left).
+        frac = pi / max(1, len(pre_v) - 1) if len(pre_v) > 1 else 0.0
+        target = int(round(frac * (len(post_v) - 1))) if len(post_v) > 1 else 0
+        target = max(0, min(target, len(post_v) - 1))
+        for cand in (target, target - 1, target + 1):
+            if 0 <= cand < len(post_v):
+                out[cand] = _merge_accent(out[cand], lab)
+                break
+    return out
+
 def prep_deva(src_text):
     """to_deva → strip punct → extract svara. Returns (clean_deva, accent_array)."""
     return extract_svara(strip_punct(to_deva(src_text)))
 
+def _apply_rU(slp):
+    """long vocalic ṝ (ॄ/ॠ) → repha+ū: IndicF5 mispronounces Kannada ೄ (U+0CC4)."""
+    return slp.replace("F", "rU")
+
 def _deva_to_slp1(clean_deva):
     """Phoneme-only Devanagari → SLP1 with the IndicF5 ṝ workaround."""
-    slp = sanscript.transliterate(clean_deva, sanscript.DEVANAGARI, sanscript.SLP1)
-    # long vocalic ṝ (ॄ/ॠ) → repha+ū: IndicF5 mispronounces Kannada ೄ (U+0CC4). Fix at SLP1 so tF→trU→ತ್ರೂ
-    return slp.replace("F", "rU")
+    return _apply_rU(sanscript.transliterate(clean_deva, sanscript.DEVANAGARI, sanscript.SLP1))
 
 def _slp1_to_kannada(slp):
     return sanscript.transliterate(slp, sanscript.SLP1, sanscript.KANNADA)
+
+def _accents_for_slp1(clean_deva, accents, final_slp):
+    """Map Devanagari-extracted accents onto final SLP1 nuclei (handles F→rU)."""
+    pre = sanscript.transliterate(clean_deva, sanscript.DEVANAGARI, sanscript.SLP1)
+    accents = align_accent_array(accents, slp1_syllable_count(pre))
+    if pre == final_slp:
+        return accents
+    return remap_accents_slp1(pre, final_slp, accents)
 
 def _next_real(s, i):
     """Index of next non-skip char after position i, or None."""
@@ -297,7 +396,7 @@ def model_text(src_text):
     """
     clean, accents = prep_deva(src_text)
     slp = _deva_to_slp1(clean)
-    accents = align_accent_array(accents, slp1_syllable_count(slp))
+    accents = _accents_for_slp1(clean, accents, slp)
     return _slp1_to_kannada(slp), accents
 
 # ── word-boundary visarga sandhi (SLP1) ──────────────────────────────────────────────
@@ -349,19 +448,21 @@ def model_text_sandhi(src_text, echo_final=True):
     jihvāmūlīya/upadhmānīya left PLAIN — the model learned those acoustically) → echo-vowel on the
     segment-final visarga (ḥ→ha/hi/hu/hai…) → SLP1→Kannada.
 
-    Returns (kannada_text, accent_array). Accent indices follow pre-sandhi syllables; if sandhi/echo
-    changes the vowel count, the array is padded/truncated to the final SLP1 syllable count (new
-    nuclei get None) so it stays 1:1 with gaṇa detection on the model string.
+    Returns (kannada_text, accent_array). Accents are remapped through each SLP1 transform
+    (visarga sandhi, optional echo, F→rU) via remap_accents_slp1 so mid-string merges keep
+    labels on the surviving nucleus (1:1 with final gaṇa syllables).
     """
     clean, accents = prep_deva(src_text)
-    slp = sanscript.transliterate(clean, sanscript.DEVANAGARI, sanscript.SLP1)
-    # Align accents to pre-sandhi nuclei first (authoritative mapping from the source text).
-    accents = align_accent_array(accents, slp1_syllable_count(slp))
-    slp = visarga_sandhi(slp)
+    slp0 = sanscript.transliterate(clean, sanscript.DEVANAGARI, sanscript.SLP1)
+    accents = align_accent_array(accents, slp1_syllable_count(slp0))
+    slp1 = visarga_sandhi(slp0)
+    accents = remap_accents_slp1(slp0, slp1, accents)
     if echo_final:
-        slp = visarga_echo_final(slp)
-    slp = slp.replace("F", "rU")   # long vocalic ṝ (ॄ/ॠ) → repha+ū (incl. sandhi-generated F)
-    accents = align_accent_array(accents, slp1_syllable_count(slp))
+        slp2 = visarga_echo_final(slp1)
+        accents = remap_accents_slp1(slp1, slp2, accents)
+        slp1 = slp2
+    slp = _apply_rU(slp1)
+    accents = remap_accents_slp1(slp1, slp, accents)
     return _slp1_to_kannada(slp), accents
 
 def model_text_norm(src_text):
@@ -369,12 +470,16 @@ def model_text_norm(src_text):
     (plain ः kept before k/p, since ೱ/ೲ are OOV). Applies anusvāra→homorganic nasal +
     visarga→sibilant gemination, shloka-final ः preserved. All output chars are in the Kannada vocab.
 
-    Returns (kannada_text, accent_array) — accents taken from the pre-phonetic source syllables.
+    Returns (kannada_text, accent_array) remapped through phonetic_mfa + F→rU onto final nuclei.
     """
     clean, accents = prep_deva(src_text)
     phon = phonetic_mfa(clean, kannada_safe=True)
-    # phonetic_mfa can insert virāma+nasal but not new vowel nuclei; realign defensively.
-    accents = align_accent_array(accents, slp1_syllable_count(_deva_to_slp1(phon)))
+    pre = sanscript.transliterate(clean, sanscript.DEVANAGARI, sanscript.SLP1)
+    accents = align_accent_array(accents, slp1_syllable_count(pre))
+    mid = sanscript.transliterate(phon, sanscript.DEVANAGARI, sanscript.SLP1)
+    accents = remap_accents_slp1(pre, mid, accents)
+    final = _apply_rU(mid)
+    accents = remap_accents_slp1(mid, final, accents)
     return sanscript.transliterate(phon, sanscript.DEVANAGARI, sanscript.KANNADA), accents
 
 def mfa_text(src_text):
